@@ -3,8 +3,8 @@
 [![PyPI - Version](https://img.shields.io/pypi/v/apluggy.svg)](https://pypi.org/project/apluggy)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/apluggy.svg)](https://pypi.org/project/apluggy)
 
-[![Test Status](https://github.com/nextline-dev/apluggy/actions/workflows/unit-test.yml/badge.svg)](https://github.com/nextline-dev/apluggy/actions/workflows/unit-test.yml)
-[![Test Status](https://github.com/nextline-dev/apluggy/actions/workflows/type-check.yml/badge.svg)](https://github.com/nextline-dev/apluggy/actions/workflows/type-check.yml)
+[![Test Status](https://github.com/schuyler/apluggy/actions/workflows/unit-test.yml/badge.svg)](https://github.com/schuyler/apluggy/actions/workflows/unit-test.yml)
+[![Test Status](https://github.com/schuyler/apluggy/actions/workflows/type-check.yml/badge.svg)](https://github.com/schuyler/apluggy/actions/workflows/type-check.yml)
 [![codecov](https://codecov.io/gh/nextline-dev/apluggy/branch/main/graph/badge.svg)](https://codecov.io/gh/nextline-dev/apluggy)
 
 A wrapper of [pluggy](https://pluggy.readthedocs.io/) to support asyncio and context managers.
