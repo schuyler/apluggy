@@ -11,6 +11,31 @@ if TYPE_CHECKING:
     from pluggy._hooks import HookImpl
 
 
+def _first_exception(hook_name: str, outcomes: list[Any]) -> BaseException | None:
+    """Return the first exception among gathered ``outcomes``, or None.
+
+    ``outcomes`` comes from ``asyncio.gather(..., return_exceptions=True)``,
+    in execution order. The first exception is the one the caller (or the
+    wrappers) receive. Every later one is attached to it as a note naming the
+    hook and the other exception's type and message, so a second failure is
+    never silently dropped. Notes need ``BaseException.add_note`` (Python
+    3.11+); on 3.10 the later exceptions are dropped as before.
+    """
+    errors = [o for o in outcomes if isinstance(o, BaseException)]
+    if not errors:
+        return None
+    first = errors[0]
+    # Record each other failure on the exception that is raised.
+    add_note = getattr(first, "add_note", None)
+    if add_note is not None:
+        for other in errors[1:]:
+            add_note(
+                f"apluggy: {hook_name}: another implementation also raised "
+                f"{type(other).__name__}: {other}"
+            )
+    return first
+
+
 async def _call_firstresult(
     hook: HookCaller,
     caller_kwargs: dict[str, Any],
@@ -149,9 +174,7 @@ async def _async_multicall(
                 *(func(**kwargs) for func, kwargs in pending),
                 return_exceptions=True,
             )
-            exception = next(
-                (o for o in outcomes if isinstance(o, BaseException)), None
-            )
+            exception = _first_exception(hook_name, outcomes)
             if exception is None:
                 results = list(outcomes)
 
@@ -260,9 +283,17 @@ class AHook:
                 return await _call_firstresult(hook, kwargs)
             else:
                 # firstresult=False, no wrappers: collect unawaited coroutines from
-                # pluggy's _multicall and run them concurrently.
+                # pluggy's _multicall and run them concurrently. Every one runs
+                # to completion (return_exceptions=True), so a raising
+                # implementation neither cancels nor orphans its siblings; then
+                # the first exception in execution order is raised, with the
+                # others as notes. Same semantics as the wrapper path.
                 coros: list[asyncio.Future] = hook(*args, **kwargs)
-                return await asyncio.gather(*coros)
+                outcomes = await asyncio.gather(*coros, return_exceptions=True)
+                exception = _first_exception(name, outcomes)
+                if exception is not None:
+                    raise exception
+                return outcomes
 
         return call
 
