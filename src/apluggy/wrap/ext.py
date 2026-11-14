@@ -53,7 +53,9 @@ async def _async_multicall(
 
     Mirrors pluggy's _multicall (_callers.py:76-169) but handles async
     non-wrappers and sync generator wrappers. Wrappers are set up first
-    (pre-yield code runs during setup), then non-wrappers are awaited, then
+    (pre-yield code runs during setup), then non-wrappers are awaited
+    (concurrently for firstresult=False, as without wrappers; in order for
+    firstresult=True, stopping at the first non-None result), then
     wrappers are torn down in reverse order (post-yield code runs, result or
     exception is passed back via send/throw).
 
@@ -76,6 +78,10 @@ async def _async_multicall(
 
     # results accumulates return values from non-wrapper hookimpls.
     results: list[Any] = []
+
+    # pending holds broadcast (firstresult=False) non-wrappers, as function and
+    # kwargs, to be gathered concurrently once every wrapper is set up.
+    pending: list[tuple[Callable[..., Any], dict[str, Any]]] = []
 
     # exception captures any exception raised during setup or invocation, so
     # teardown wrappers can receive it via throw().
@@ -115,14 +121,39 @@ async def _async_multicall(
                 # Push the generator onto the teardown stack for post-yield processing.
                 teardowns.append(gen)
 
+            elif not firstresult:
+                # Broadcast non-wrapper: defer it so all of them can be gathered
+                # concurrently below, as on the no-wrapper path. The coroutine is
+                # not created yet, so a later wrapper's setup failure leaves no
+                # never-awaited coroutine behind.
+                pending.append((hook_impl.function, impl_kwargs))
+
             else:
-                # Regular (non-wrapper) hookimpl: await its coroutine and collect the result.
+                # firstresult non-wrapper: await in order and stop at the first
+                # non-None result, so these must stay sequential.
                 result = await hook_impl.function(**impl_kwargs)
                 results.append(result)
-
-                # firstresult semantics: stop after the first non-None result.
-                if firstresult and result is not None:
+                if result is not None:
                     break
+
+        # -----------------------------------------------------------------------
+        # Broadcast invocation: run every deferred non-wrapper concurrently.
+        # pluggy stores wrappers after non-wrappers, so every wrapper's pre-yield
+        # code has already run by now, matching the sequential order. Each one
+        # runs to completion (return_exceptions=True): a raising implementation
+        # neither cancels nor orphans its siblings. The first exception in
+        # execution order is then thrown into the wrappers.
+        # -----------------------------------------------------------------------
+        if pending:
+            outcomes = await asyncio.gather(
+                *(func(**kwargs) for func, kwargs in pending),
+                return_exceptions=True,
+            )
+            exception = next(
+                (o for o in outcomes if isinstance(o, BaseException)), None
+            )
+            if exception is None:
+                results = list(outcomes)
 
     except BaseException as e:
         # Any exception during setup or invocation (from a wrapper's pre-yield

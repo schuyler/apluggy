@@ -644,3 +644,99 @@ async def test_regression_no_wrappers_firstresult_true_returns_single_value() ->
 
     # Plugin_B runs first and returns 10; chain stops.
     assert result == 10, f"Expected 10 (firstresult from Plugin_B), got {result}"
+
+
+# ===========================================================================
+# Concurrency of non-wrappers under a wrapper (firstresult=False)
+# ===========================================================================
+
+
+async def test_wrapped_broadcast_runs_non_wrappers_concurrently() -> None:
+    """A wrapper must not serialise the non-wrappers of a broadcast hook.
+
+    Without wrappers, firstresult=False implementations are gathered. Adding a
+    wrapper must keep that: here each implementation waits for the other to
+    start, which deadlocks (and times out) if they are awaited one by one.
+    """
+    import asyncio
+
+    a_started = asyncio.Event()
+    b_started = asyncio.Event()
+
+    class Plugin_A:
+        @hookimpl
+        async def ahook(self, value: int) -> int:
+            a_started.set()
+            await b_started.wait()
+            return value + 1
+
+    class Plugin_B:
+        @hookimpl
+        async def ahook(self, value: int) -> int:
+            b_started.set()
+            await a_started.wait()
+            return value + 2
+
+    class Plugin_Wrapper:
+        @hookimpl(wrapper=True)
+        def ahook(self, value: int):
+            result = yield
+            return result
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(Spec)
+    pm.register(Plugin_A())
+    pm.register(Plugin_B())
+    pm.register(Plugin_Wrapper())
+
+    result = await asyncio.wait_for(pm.ahook.ahook(value=10), timeout=2)
+
+    # Result order is pluggy's execution order (last registered first),
+    # the same order the sequential path produced.
+    assert result == [12, 11], f"Expected [12, 11], got {result}"
+
+
+async def test_wrapped_broadcast_exception_waits_for_siblings() -> None:
+    """A raising non-wrapper does not cancel or orphan its siblings.
+
+    Every non-wrapper runs to completion; then the first exception (in
+    execution order) is thrown into the wrapper.
+    """
+    import asyncio
+
+    finished: list[str] = []
+    seen: list[BaseException] = []
+
+    class Plugin_Slow:
+        @hookimpl
+        async def ahook(self, value: int) -> int:
+            await asyncio.sleep(0.05)
+            finished.append("slow")
+            return value
+
+    class Plugin_Raises:
+        @hookimpl
+        async def ahook(self, value: int) -> int:
+            raise ValueError(f"bad value: {value}")
+
+    class Plugin_Wrapper:
+        @hookimpl(wrapper=True)
+        def ahook(self, value: int):
+            try:
+                result = yield
+            except ValueError as e:
+                seen.append(e)
+                raise
+            return result
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(Spec)
+    pm.register(Plugin_Slow())
+    pm.register(Plugin_Raises())
+    pm.register(Plugin_Wrapper())
+
+    with pytest.raises(ValueError, match="bad value: 3"):
+        await pm.ahook.ahook(value=3)
+
+    assert finished == ["slow"], "sibling must finish before the call returns"
+    assert len(seen) == 1 and "bad value: 3" in str(seen[0])
