@@ -36,9 +36,9 @@ tests = [
 type-check = ["mypy>=1.0"]
 
 [project.urls]
-Documentation = "https://github.com/nextline-dev/apluggy#readme"
-Issues = "https://github.com/nextline-dev/apluggy/issues"
-Source = "https://github.com/nextline-dev/apluggy"
+Documentation = "https://github.com/schuyler/apluggy#readme"
+Issues = "https://github.com/schuyler/apluggy/issues"
+Source = "https://github.com/schuyler/apluggy"
 
 [tool.hatch.version]
 source = "regex_commit"
