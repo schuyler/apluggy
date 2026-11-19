@@ -2,13 +2,24 @@ import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Coroutine
 
-from pluggy import HookCaller
+from pluggy import HookCaller, HookCallError
 from pluggy import PluginManager as PluginManager_
 
 from apluggy.stack import AGenCtxMngr, GenCtxMngr, async_stack_gen_ctxs, stack_gen_ctxs
 
 if TYPE_CHECKING:
     from pluggy._hooks import HookImpl
+
+
+def _impl_kwargs(
+    hook_impl: "HookImpl", caller_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    # Select only the args this hookimpl declares. A missing one is a caller
+    # error, so raise what pluggy's _multicall raises rather than a bare KeyError.
+    try:
+        return {k: caller_kwargs[k] for k in hook_impl.argnames}
+    except KeyError as e:
+        raise HookCallError(f"hook call must provide argument {e.args[0]!r}") from e
 
 
 async def _call_firstresult(
@@ -30,7 +41,7 @@ async def _call_firstresult(
         # Build kwargs from argnames only, matching pluggy's _multicall behavior.
         # kwargnames is intentionally excluded — pluggy does not pass keyword-only
         # parameters through hook dispatch.
-        impl_kwargs = {k: caller_kwargs[k] for k in hook_impl.argnames}
+        impl_kwargs = _impl_kwargs(hook_impl, caller_kwargs)
 
         # Invoke the hookimpl function to get a coroutine, then await it.
         result = await hook_impl.function(**impl_kwargs)
@@ -89,7 +100,7 @@ async def _async_multicall(
         for hook_impl in reversed(hookimpls):
             # Build kwargs by selecting only the args this hookimpl declares.
             # pluggy strips 'self' from argnames, so we never need to pass it.
-            impl_kwargs = {k: caller_kwargs[k] for k in hook_impl.argnames}
+            impl_kwargs = _impl_kwargs(hook_impl, caller_kwargs)
 
             if hook_impl.hookwrapper:
                 # Old-style hookwrapper=True is not supported in this dispatch path.
@@ -219,6 +230,8 @@ class AHook:
             if has_wrappers:
                 # Wrapper path: drive setup, invocation, and teardown manually.
                 # Handles both firstresult=True and firstresult=False.
+                # Skips HookCaller.__call__, so warn about omitted spec args here.
+                hook._verify_all_args_are_provided(kwargs)
                 return await _async_multicall(name, hookimpls, kwargs, firstresult)
             elif firstresult:
                 # firstresult=True, no wrappers: bypass _multicall; iterate impls
@@ -226,6 +239,8 @@ class AHook:
                 # hooks, which is not iterable and would crash asyncio.gather.
                 # Positional args are intentionally not forwarded here — pluggy
                 # hookspecs use keyword arguments exclusively.
+                # Skips HookCaller.__call__, so warn about omitted spec args here.
+                hook._verify_all_args_are_provided(kwargs)
                 return await _call_firstresult(hook, kwargs)
             else:
                 # firstresult=False, no wrappers: collect unawaited coroutines from
