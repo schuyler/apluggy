@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Coroutine
 
-from pluggy import HookCaller, HookCallError
+from pluggy import HookCaller, HookCallError, Result
 from pluggy import PluginManager as PluginManager_
 
 from apluggy.stack import AGenCtxMngr, GenCtxMngr, async_stack_gen_ctxs, stack_gen_ctxs
@@ -64,7 +64,9 @@ async def _async_multicall(
 
     Mirrors pluggy's _multicall (_callers.py:76-169) but handles async
     non-wrappers and sync generator wrappers. Wrappers are set up first
-    (pre-yield code runs during setup), then non-wrappers are awaited, then
+    (pre-yield code runs during setup), then non-wrappers are awaited
+    (concurrently for firstresult=False, as without wrappers; in order for
+    firstresult=True, stopping at the first non-None result), then
     wrappers are torn down in reverse order (post-yield code runs, result or
     exception is passed back via send/throw).
 
@@ -87,6 +89,10 @@ async def _async_multicall(
 
     # results accumulates return values from non-wrapper hookimpls.
     results: list[Any] = []
+
+    # pending holds broadcast (firstresult=False) non-wrappers, as function and
+    # kwargs, to be gathered concurrently once every wrapper is set up.
+    pending: list[tuple[Callable[..., Any], dict[str, Any]]] = []
 
     # exception captures any exception raised during setup or invocation, so
     # teardown wrappers can receive it via throw().
@@ -126,14 +132,39 @@ async def _async_multicall(
                 # Push the generator onto the teardown stack for post-yield processing.
                 teardowns.append(gen)
 
+            elif not firstresult:
+                # Broadcast non-wrapper: defer it so all of them can be gathered
+                # concurrently below, as on the no-wrapper path. The coroutine is
+                # not created yet, so a later wrapper's setup failure leaves no
+                # never-awaited coroutine behind.
+                pending.append((hook_impl.function, impl_kwargs))
+
             else:
-                # Regular (non-wrapper) hookimpl: await its coroutine and collect the result.
+                # firstresult non-wrapper: await in order and stop at the first
+                # non-None result, so these must stay sequential.
                 result = await hook_impl.function(**impl_kwargs)
                 results.append(result)
-
-                # firstresult semantics: stop after the first non-None result.
-                if firstresult and result is not None:
+                if result is not None:
                     break
+
+        # -----------------------------------------------------------------------
+        # Broadcast invocation: run every deferred non-wrapper concurrently.
+        # pluggy stores wrappers after non-wrappers, so every wrapper's pre-yield
+        # code has already run by now, matching the sequential order. Each one
+        # runs to completion (return_exceptions=True): a raising implementation
+        # neither cancels nor orphans its siblings. The first exception in
+        # execution order is then thrown into the wrappers.
+        # -----------------------------------------------------------------------
+        if pending:
+            outcomes = await asyncio.gather(
+                *(func(**kwargs) for func, kwargs in pending),
+                return_exceptions=True,
+            )
+            exception = next(
+                (o for o in outcomes if isinstance(o, BaseException)), None
+            )
+            if exception is None:
+                results = list(outcomes)
 
     except BaseException as e:
         # Any exception during setup or invocation (from a wrapper's pre-yield
@@ -206,11 +237,152 @@ async def _async_multicall(
     return aggregate
 
 
+class _Escaped:
+    """A KeyboardInterrupt or SystemExit caught inside one implementation.
+
+    asyncio's task step re-raises these two straight out of the event loop
+    instead of storing them on the task, so gather(return_exceptions=True)
+    would never see them and the siblings would be abandoned. Boxing them as a
+    plain value lets every sibling finish before _call_isolated re-raises.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+
+async def _call_isolated(
+    hook: HookCaller,
+    caller_kwargs: dict[str, Any],
+    timeout: float | None,
+) -> list[tuple[str, Result]]:
+    """Run every hookimpl to completion and report each one's outcome.
+
+    Returns one (plugin_name, pluggy.Result) pair per implementation, in
+    pluggy's execution order (tryfirst first, trylast last). Each Result holds
+    the implementation's return value or the Exception it raised; with a
+    timeout, an implementation that overruns is cancelled and its Result holds
+    asyncio.TimeoutError. A BaseException that is not an Exception (e.g.
+    CancelledError, KeyboardInterrupt) is raised once every sibling has
+    finished, the first in hook order if several.
+
+    Like the firstresult and wrapper paths, this skips pluggy's _hookexec, so
+    hook-call monitoring and tracing don't see these calls.
+
+    Raises:
+        HookCallError: the hook is firstresult=True, has a wrapper=True or
+            hookwrapper=True implementation, or the call omits an argument an
+            implementation needs. Nothing has run when this is raised.
+    """
+    hookimpls: list[HookImpl] = hook.get_hookimpls()
+
+    # Refuse hooks this mode can't drive faithfully, before anything runs:
+    # firstresult stops at the first value, and a wrapper expects an exception
+    # thrown into it, which this mode reports instead of raising.
+    if hook.spec and hook.spec.opts.get("firstresult", False):
+        raise HookCallError(
+            f"{hook.name}: return_exceptions=True can't run a firstresult=True "
+            "hook; call it through pm.ahook"
+        )
+    for hook_impl in hookimpls:
+        if hook_impl.wrapper or hook_impl.hookwrapper:
+            option = "wrapper" if hook_impl.wrapper else "hookwrapper"
+            raise HookCallError(
+                f"{hook.name}: return_exceptions=True can't run the {option}=True "
+                f"implementation in plugin {hook_impl.plugin_name!r}; call the "
+                "hook through pm.ahook"
+            )
+
+    # Warn about omitted spec args as HookCaller.__call__ would, then bind
+    # every implementation's kwargs eagerly, so a missing argument raises
+    # before any implementation is called.
+    hook._verify_all_args_are_provided(caller_kwargs)
+    calls = [
+        (hook_impl, _impl_kwargs(hook_impl, caller_kwargs))
+        for hook_impl in reversed(hookimpls)
+    ]
+
+    async def invoke(hook_impl: "HookImpl", impl_kwargs: dict[str, Any]) -> Any:
+        # The innermost coroutine: call the implementation here, so a sync
+        # implementation's raise or non-awaitable return is its own outcome,
+        # and box KeyboardInterrupt/SystemExit here, inside any Task that
+        # wait_for creates, so they can't escape the loop.
+        try:
+            return await hook_impl.function(**impl_kwargs)
+        except (KeyboardInterrupt, SystemExit) as e:
+            return _Escaped(e)
+
+    async def run(hook_impl: "HookImpl", impl_kwargs: dict[str, Any]) -> Any:
+        # Apply the per-implementation time limit, if any.
+        if timeout is None:
+            return await invoke(hook_impl, impl_kwargs)
+        return await asyncio.wait_for(invoke(hook_impl, impl_kwargs), timeout)
+
+    # Run all implementations concurrently; return_exceptions lets each one
+    # finish whatever its siblings do.
+    outcomes = await asyncio.gather(
+        *(run(hook_impl, impl_kwargs) for hook_impl, impl_kwargs in calls),
+        return_exceptions=True,
+    )
+
+    # Every sibling has finished: re-raise the first BaseException that is not
+    # an Exception, in hook order.
+    for outcome in outcomes:
+        if isinstance(outcome, _Escaped):
+            raise outcome.exc
+        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+            raise outcome
+
+    # Pair each outcome with the plugin whose implementation produced it.
+    return [
+        (
+            hook_impl.plugin_name,
+            Result(None, outcome)
+            if isinstance(outcome, BaseException)
+            else Result(outcome, None),
+        )
+        for (hook_impl, _), outcome in zip(calls, outcomes)
+    ]
+
+
 class AHook:
-    def __init__(self, pm: PluginManager_) -> None:
+    """Call async hooks: ``await pm.ahook.<hook>(**kwargs)``.
+
+    With ``return_exceptions=True`` (``pm.ahook_isolated``), a call runs every
+    implementation to completion and returns ``(plugin_name, pluggy.Result)``
+    pairs in hook order instead of raising the first exception. Unlike
+    asyncio's flag of the same name, the results are attributed Result
+    objects, not bare exceptions. ``timeout`` (seconds) then limits each
+    implementation separately. See _call_isolated.
+    """
+
+    def __init__(
+        self,
+        pm: PluginManager_,
+        return_exceptions: bool = False,
+        timeout: float | None = None,
+    ) -> None:
+        # A timeout is only applied per implementation in isolated mode; on
+        # the default path it would silently do nothing.
+        if timeout is not None and not return_exceptions:
+            raise ValueError(
+                "AHook: timeout requires return_exceptions=True; pass both, or "
+                "drop timeout"
+            )
         self.pm = pm
+        # Underscored so they never shadow a hook of the same name.
+        self._return_exceptions = return_exceptions
+        self._timeout = timeout
 
     def __getattr__(self, name: str) -> Callable[..., Coroutine[Any, Any, Any]]:
+        if self._return_exceptions:
+
+            async def call_isolated(**kwargs: Any) -> list[tuple[str, Result]]:
+                # Keyword arguments only, as pluggy's HookCaller requires.
+                hook: HookCaller = getattr(self.pm.hook, name)
+                return await _call_isolated(hook, kwargs, self._timeout)
+
+            return call_isolated
+
         async def call(*args: Any, **kwargs: Any) -> Any:
             # Resolve the named HookCaller from pluggy's hook namespace.
             hook: HookCaller = getattr(self.pm.hook, name)

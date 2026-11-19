@@ -32,6 +32,7 @@ which
   - [Call hooks](#call-hooks)
     - [Async function](#async-function)
       - [firstresult=True](#firstresulttrue)
+      - [Exceptions and ahook_isolated](#exceptions-and-ahook_isolated)
     - [Context manager](#context-manager)
     - [Async context manager](#async-context-manager)
 - [Links](#links)
@@ -243,6 +244,62 @@ implementations are gathered concurrently.
 3
 
 ```
+
+##### Exceptions and ahook_isolated
+
+With `pm.ahook`, an exception from one implementation propagates to the
+caller and the other results are lost. On a broadcast hook without wrappers,
+the other implementations keep running, unobserved, and any exception they
+raise later is never reported.
+
+`pm.ahook_isolated` runs every implementation to completion and returns one
+`(plugin_name, pluggy.Result)` pair per implementation, in hook order. Each
+`Result` holds the return value or the exception raised, so nothing is lost and
+every outcome is attributed to its plugin. (Unlike asyncio's
+`gather(return_exceptions=True)`, which puts bare exceptions in the list.) A
+`BaseException` that is not an `Exception`, such as `CancelledError`, is
+raised once every implementation has finished.
+
+```python
+>>> class SpecIso:
+...     @hookspec
+...     async def afunc_iso(self, arg):
+...         pass
+
+>>> class Plugin_OK:
+...     @hookimpl
+...     async def afunc_iso(self, arg):
+...         return arg * 2
+
+>>> class Plugin_Fails:
+...     @hookimpl
+...     async def afunc_iso(self, arg):
+...         raise ValueError(f'bad arg: {arg}')
+
+>>> pm_iso = pluggy.PluginManager('project')
+>>> pm_iso.add_hookspecs(SpecIso)
+>>> _ = pm_iso.register(Plugin_OK())
+>>> _ = pm_iso.register(Plugin_Fails())
+
+>>> async def call_afunc_iso():
+...     for name, result in await pm_iso.ahook_isolated.afunc_iso(arg=21):
+...         if result.exception is not None:
+...             print(name, 'raised', repr(result.exception))
+...         else:
+...             print(name, 'returned', result.get_result())
+
+>>> asyncio.run(call_afunc_iso())
+Plugin_Fails_... raised ValueError('bad arg: 21')
+Plugin_OK_... returned 42
+
+```
+
+`pm.ahook_isolated` is `AHook(pm, return_exceptions=True)` from
+`apluggy.wrap.ext`. Construct one with `timeout=` (seconds) to limit each
+implementation separately: one that overruns is cancelled, and its `Result`
+holds `asyncio.TimeoutError`. Hooks with a `wrapper=True` or `hookwrapper=True`
+implementation, and `firstresult=True` hooks, are refused with `HookCallError`;
+call those through `pm.ahook`.
 
 #### Context manager
 
