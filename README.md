@@ -248,8 +248,9 @@ implementations are gathered concurrently.
 ##### Exceptions and ahook_isolated
 
 With `pm.ahook`, an exception from one implementation propagates to the
-caller and the other results are lost. The other implementations keep
-running, unobserved, and any exception they raise later is never reported.
+caller and the other results are lost. On a broadcast hook without wrappers,
+the other implementations keep running, unobserved, and any exception they
+raise later is never reported.
 
 `pm.ahook_isolated` runs every implementation to completion and returns one
 `(plugin_name, pluggy.Result)` pair per implementation, in hook order. Each
