@@ -51,10 +51,12 @@ def _pm(*plugins: object, specs: bool = False) -> PluginManager:
 def _run_in_fresh_loop(make: Callable[[], Awaitable[Any]]) -> Any:
     # Run the awaitable in its own loop, so a KeyboardInterrupt that escapes the
     # loop surfaces as this test's own exception instead of wrecking the session.
-    async def bounded() -> Any:
-        return await asyncio.wait_for(make(), 5)
+    # No inner wait_for: on 3.10/3.11 it would add the very Task boundary these
+    # tests probe; pytest-timeout bounds the test instead.
+    async def run() -> Any:
+        return await make()
 
-    return asyncio.run(bounded())
+    return asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
