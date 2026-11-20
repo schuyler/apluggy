@@ -113,8 +113,6 @@ class PluginManager(PluginManager_):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.ahook = AHook(self)
-        # Every implementation runs to completion; each outcome is reported.
-        self.ahook_isolated = AHook(self, return_exceptions=True)
         self.with_ = With(self)
         self.with_reverse = With(self, reverse=True)
         self.awith = AWith(self)
