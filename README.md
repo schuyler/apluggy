@@ -248,10 +248,12 @@ implementations are gathered concurrently.
 ##### Exceptions
 
 With `pm.ahook`, an exception from one implementation propagates to the
-caller and the other results are lost. On a broadcast hook without wrappers,
-the other implementations keep running, unobserved, and any exception they
-raise later is never reported. With a wrapper, every implementation finishes
-first and the first exception in hook order is thrown into the wrappers.
+caller, unless a wrapper handles it, and the other results are lost. On a
+broadcast hook without wrappers, the other implementations keep running,
+unobserved, and any exception they raise later is never reported. On a
+broadcast hook with a wrapper, every implementation finishes first and the
+first exception in hook order is thrown into the wrappers. A `firstresult=True`
+hook runs its implementations one at a time and stops at the first exception.
 
 #### Context manager
 
