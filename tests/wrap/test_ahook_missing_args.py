@@ -234,3 +234,63 @@ async def test_a_sync_impl_returning_none_is_skipped_like_multicall() -> None:
 
     # Registration order reversed, as pluggy dispatches: sum, x, sync-none.
     assert await pm.ahook.all_plain(channel=1) == [6, 1]
+
+
+async def test_the_broadcast_applies_the_spec_defaults() -> None:
+    """An omitted argument takes the *hookspec's* default, as HookCaller does.
+
+    Behaviour inherited from `_multicall`; the pre-binding path lost it and
+    raised HookCallError for an implementation that has no default of its own.
+    """
+
+    class Spec:
+        @hookspec
+        async def defaults(self, channel: int, mode: str = "fast") -> tuple: ...  # pragma: no cover
+
+    class NoOwnDefault:
+        @hookimpl
+        async def defaults(self, channel: int, mode):
+            return ("impl", channel, mode)
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(Spec)
+    pm.register(NoOwnDefault(), name="nodefault")
+
+    assert await pm.ahook.defaults(channel=1) == [("impl", 1, "fast")]
+    assert await pm.ahook.defaults(channel=1, mode="slow") == [("impl", 1, "slow")]
+
+
+async def test_an_async_return_of_none_keeps_its_slot() -> None:
+    """Only a call-time None is dropped; an awaited None is a result (#10 review).
+
+    pluggy filters on the coroutine object, which is never None, so every async
+    implementation contributes a slot.
+    """
+
+    class Spec:
+        @hookspec
+        async def slots(self, x: int) -> int: ...  # pragma: no cover
+
+    class Ten:
+        @hookimpl
+        async def slots(self, x: int):
+            return x * 10
+
+    class NoneResult:
+        @hookimpl
+        async def slots(self, x: int):
+            return None
+
+    class One:
+        @hookimpl
+        async def slots(self, x: int):
+            return x
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(Spec)
+    pm.register(Ten(), name="ten")
+    pm.register(NoneResult(), name="none")
+    pm.register(One(), name="one")
+
+    # Reversed registration order, as pluggy dispatches.
+    assert await pm.ahook.slots(x=1) == [1, None, 10]

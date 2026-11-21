@@ -14,12 +14,27 @@ if TYPE_CHECKING:
 def _impl_kwargs(
     hook_impl: "HookImpl", caller_kwargs: dict[str, Any]
 ) -> dict[str, Any]:
-    # Select only the args this hookimpl declares. A missing one is a caller
-    # error, so raise what pluggy's _multicall raises rather than a bare KeyError.
+    """The keyword arguments one implementation is called with.
+
+    Mirrors pluggy's _multicall: the names it declares come from the call (a
+    missing one is a caller error, raised as HookCallError rather than a bare
+    KeyError), and anything else the caller passed goes on to an implementation
+    that accepts **kwargs. Without that second part a keyword argument an
+    implementation does not declare is silently dropped instead of reaching it.
+    """
     try:
-        return {k: caller_kwargs[k] for k in hook_impl.argnames}
+        kwargs = {k: caller_kwargs[k] for k in hook_impl.argnames}
     except KeyError as e:
         raise HookCallError(f"hook call must provide argument {e.args[0]!r}") from e
+    if hook_impl.kwargnames:
+        kwargs.update(
+            {
+                k: v
+                for k, v in caller_kwargs.items()
+                if k not in hook_impl.argnames
+            }
+        )
+    return kwargs
 
 
 async def _call_firstresult(
@@ -88,8 +103,7 @@ async def _call_broadcast(
         result = hook_impl.function(**impl_kwargs)
         if result is not None:
             pending.append(result)
-    results = await asyncio.gather(*pending)
-    return [result for result in results if result is not None]
+    return list(await asyncio.gather(*pending))
 
 
 async def _async_multicall(
@@ -319,8 +333,9 @@ class AHook:
                 # what stops the never-awaited coroutines: the missing argument
                 # belongs to an implementation, and it is the pre-binding in
                 # _call_broadcast that raises before any coroutine exists.
-                hook._verify_all_args_are_provided(kwargs)
-                return await _call_broadcast(hook, kwargs)
+                call_kwargs = dict(hook._apply_defaults(kwargs))
+                hook._verify_all_args_are_provided(call_kwargs)
+                return await _call_broadcast(hook, call_kwargs)
 
         return call
 
