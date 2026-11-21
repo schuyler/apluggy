@@ -54,6 +54,30 @@ async def _call_firstresult(
     return None
 
 
+async def _call_broadcast(
+    hook: HookCaller,
+    caller_kwargs: dict[str, Any],
+) -> list[Any]:
+    """Await every implementation concurrently, binding all of them first.
+
+    pluggy's _multicall builds each implementation's coroutine as it walks the
+    list and raises when it reaches one that needs an argument the call omitted,
+    which leaves the coroutines it had already built unawaited. Binding every
+    implementation's arguments before creating any coroutine means a missing
+    argument raises with nothing left behind.
+
+    Order matches `_multicall`: implementations in reverse storage order, one
+    result each, in that order.
+    """
+    bound = [
+        (hook_impl, _impl_kwargs(hook_impl, caller_kwargs))
+        for hook_impl in reversed(hook.get_hookimpls())
+    ]
+    return await asyncio.gather(
+        *(hook_impl.function(**impl_kwargs) for hook_impl, impl_kwargs in bound)
+    )
+
+
 async def _async_multicall(
     hook_name: str,
     hookimpls: list["HookImpl"],
@@ -276,8 +300,12 @@ class AHook:
             else:
                 # firstresult=False, no wrappers: collect unawaited coroutines from
                 # pluggy's _multicall and run them concurrently.
-                coros: list[asyncio.Future] = hook(*args, **kwargs)
-                return await asyncio.gather(*coros)
+                # Check the arguments against the spec first, as the two branches
+                # above do: _multicall builds each implementation's coroutine as it
+                # goes and raises mid-way for one that needs a missing argument,
+                # which leaves the coroutines already built unawaited.
+                hook._verify_all_args_are_provided(kwargs)
+                return await _call_broadcast(hook, kwargs)
 
         return call
 
