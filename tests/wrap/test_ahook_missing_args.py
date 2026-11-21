@@ -6,6 +6,7 @@ path, not a bare ``KeyError``. When the hook has a spec, pluggy's ``UserWarning`
 about spec arguments missing from the call is emitted as well.
 """
 
+import gc
 import warnings
 
 import pytest
@@ -160,3 +161,39 @@ async def test_wrapper_unneeded_spec_arg_missing_warns_and_returns() -> None:
         result = await pm.ahook.extra_wrapped(channel=1)
 
     assert result == [2]
+
+
+async def test_broadcast_missing_arg_leaves_no_unawaited_coroutine() -> None:
+    """The plain broadcast path (no wrappers, firstresult=False) built every
+    implementation's coroutine through pluggy's ``_multicall`` and only then hit
+    the missing argument, so the ones already built were never awaited and Python
+    complained at collection time.
+
+    One implementation can be called without the omitted argument and one cannot,
+    which is what leaves a coroutine behind.
+    """
+
+    class Plugin:
+        @hookimpl
+        async def all_plain(self, channel: int) -> int:
+            return channel
+
+    class Needy:
+        @hookimpl
+        async def all_plain(self, channel: int, extra: int) -> int:
+            return channel + extra
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(Spec)
+    # LIFO: Plugin is called first, so its coroutine exists when Needy raises.
+    pm.register(Needy())
+    pm.register(Plugin())
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(HookCallError, match="hook call must provide argument 'extra'"):
+            await pm.ahook.all_plain(channel=1)
+        gc.collect()
+
+    leaked = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert leaked == [], [str(w.message) for w in leaked]
