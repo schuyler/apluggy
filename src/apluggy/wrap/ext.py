@@ -81,9 +81,10 @@ async def _call_broadcast(
     implementation's arguments before creating any coroutine means a missing
     argument raises with nothing left behind.
 
-    Order matches `_multicall`: implementations in reverse storage order, one
-    result each, in that order, with a non-firstresult implementation's None
-    left out as `_multicall` leaves it out.
+    Order and length match `_multicall`: implementations in reverse storage
+    order, one slot each, in that order. `_multicall` drops a call that returned
+    None, which for an async implementation never happens -- its call returns a
+    coroutine -- so an awaited None keeps its slot.
 
     Unlike ``HookCaller.__call__`` this does not refuse a historic hook: the
     async wrappers in this module are for coroutine hooks, and a historic spec
@@ -93,11 +94,10 @@ async def _call_broadcast(
         (hook_impl, _impl_kwargs(hook_impl, caller_kwargs))
         for hook_impl in reversed(hook.get_hookimpls())
     ]
-    # Call in order, as _multicall does, and keep only what it would keep: a
-    # non-firstresult implementation's None is not a result. A sync
-    # implementation returning None is therefore skipped rather than handed to
-    # gather, which would raise "an asyncio.Future ... is required" on a path
-    # that used to work.
+    # Call in order, as _multicall does, and skip a call that returned None: it
+    # is not a result there either, and a sync implementation returning None
+    # must not be handed to gather, which would raise "an asyncio.Future ...
+    # is required" on a path that used to work.
     pending: list[Any] = []
     for hook_impl, impl_kwargs in bound:
         result = hook_impl.function(**impl_kwargs)
