@@ -197,3 +197,40 @@ async def test_broadcast_missing_arg_leaves_no_unawaited_coroutine() -> None:
 
     leaked = [w for w in caught if issubclass(w.category, RuntimeWarning)]
     assert leaked == [], [str(w.message) for w in leaked]
+
+
+async def test_a_sync_impl_returning_none_is_skipped_like_multicall() -> None:
+    """A non-firstresult impl returning None contributes no result (#10 review).
+
+    pluggy's ``_multicall`` drops that None, so the broadcast must too: handing
+    it to ``asyncio.gather`` raised "an asyncio.Future, a coroutine or an
+    awaitable is required" on a path that worked before the pre-binding change.
+    """
+
+    class Spec:
+        @hookspec
+        async def all_plain(self, channel: int) -> int: ...  # pragma: no cover
+
+    class SyncNone:
+        @hookimpl
+        def all_plain(self, channel: int):
+            return None
+
+    class AsyncX:
+        @hookimpl
+        async def all_plain(self, channel: int):
+            return channel
+
+    class AsyncSum:
+        @hookimpl
+        async def all_plain(self, channel: int, extra: int = 5):
+            return channel + extra
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(Spec)
+    pm.register(SyncNone(), name="syncnone")
+    pm.register(AsyncX(), name="asyncx")
+    pm.register(AsyncSum(), name="asyncsum")
+
+    # Registration order reversed, as pluggy dispatches: sum, x, sync-none.
+    assert await pm.ahook.all_plain(channel=1) == [6, 1]

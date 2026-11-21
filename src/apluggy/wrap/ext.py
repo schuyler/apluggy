@@ -67,15 +67,29 @@ async def _call_broadcast(
     argument raises with nothing left behind.
 
     Order matches `_multicall`: implementations in reverse storage order, one
-    result each, in that order.
+    result each, in that order, with a non-firstresult implementation's None
+    left out as `_multicall` leaves it out.
+
+    Unlike ``HookCaller.__call__`` this does not refuse a historic hook: the
+    async wrappers in this module are for coroutine hooks, and a historic spec
+    dispatched through here returns a list instead of raising AssertionError.
     """
     bound = [
         (hook_impl, _impl_kwargs(hook_impl, caller_kwargs))
         for hook_impl in reversed(hook.get_hookimpls())
     ]
-    return await asyncio.gather(
-        *(hook_impl.function(**impl_kwargs) for hook_impl, impl_kwargs in bound)
-    )
+    # Call in order, as _multicall does, and keep only what it would keep: a
+    # non-firstresult implementation's None is not a result. A sync
+    # implementation returning None is therefore skipped rather than handed to
+    # gather, which would raise "an asyncio.Future ... is required" on a path
+    # that used to work.
+    pending: list[Any] = []
+    for hook_impl, impl_kwargs in bound:
+        result = hook_impl.function(**impl_kwargs)
+        if result is not None:
+            pending.append(result)
+    results = await asyncio.gather(*pending)
+    return [result for result in results if result is not None]
 
 
 async def _async_multicall(
@@ -298,12 +312,13 @@ class AHook:
                 hook._verify_all_args_are_provided(kwargs)
                 return await _call_firstresult(hook, kwargs)
             else:
-                # firstresult=False, no wrappers: collect unawaited coroutines from
-                # pluggy's _multicall and run them concurrently.
-                # Check the arguments against the spec first, as the two branches
-                # above do: _multicall builds each implementation's coroutine as it
-                # goes and raises mid-way for one that needs a missing argument,
-                # which leaves the coroutines already built unawaited.
+                # firstresult=False, no wrappers: bind every implementation's
+                # arguments, then run them concurrently.
+                # This branch also skips HookCaller.__call__, so warn about
+                # omitted spec args here as the two above do. That warning is not
+                # what stops the never-awaited coroutines: the missing argument
+                # belongs to an implementation, and it is the pre-binding in
+                # _call_broadcast that raises before any coroutine exists.
                 hook._verify_all_args_are_provided(kwargs)
                 return await _call_broadcast(hook, kwargs)
 
