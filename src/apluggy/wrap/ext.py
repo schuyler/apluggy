@@ -14,12 +14,35 @@ if TYPE_CHECKING:
 def _impl_kwargs(
     hook_impl: "HookImpl", caller_kwargs: dict[str, Any]
 ) -> dict[str, Any]:
-    # Select only the args this hookimpl declares. A missing one is a caller
-    # error, so raise what pluggy's _multicall raises rather than a bare KeyError.
+    """The keyword arguments one implementation is called with.
+
+    Mirrors pluggy's _multicall: only the names the implementation declares are
+    taken from the call, and a missing one is a caller error, raised as
+    HookCallError rather than a bare KeyError. Anything else the caller passed is
+    not forwarded, even to an implementation that accepts **kwargs -- pluggy
+    does not forward it either, and matching that matters more than improving on
+    it (see test_a_forwarded_kwarg_is_not_passed_to_an_impl_kwargs).
+    """
     try:
         return {k: caller_kwargs[k] for k in hook_impl.argnames}
     except KeyError as e:
         raise HookCallError(f"hook call must provide argument {e.args[0]!r}") from e
+
+
+def _apply_spec_defaults(
+    hook: HookCaller, caller_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply the hookspec's defaults to a copy of the call's kwargs.
+
+    ``HookCaller._apply_defaults`` arrives in pluggy 1.7 and this package
+    supports 1.3 upwards, so it is used when present and skipped when not: on
+    older pluggy a spec default simply does not exist, which is the behaviour
+    those versions already had.
+    """
+    apply_defaults = getattr(hook, "_apply_defaults", None)
+    if apply_defaults is None:
+        return dict(caller_kwargs)
+    return dict(apply_defaults(caller_kwargs))
 
 
 async def _call_firstresult(
@@ -274,10 +297,34 @@ class AHook:
                 hook._verify_all_args_are_provided(kwargs)
                 return await _call_firstresult(hook, kwargs)
             else:
-                # firstresult=False, no wrappers: collect unawaited coroutines from
-                # pluggy's _multicall and run them concurrently.
-                coros: list[asyncio.Future] = hook(*args, **kwargs)
-                return await asyncio.gather(*coros)
+                # firstresult=False, no wrappers: bind every implementation's
+                # arguments, then run them concurrently.
+                call_kwargs = _apply_spec_defaults(hook, kwargs)
+                # Validate every implementation's arguments before pluggy
+                # builds a single coroutine. This is the whole reason this
+                # branch does not just call the hook: pluggy's _multicall
+                # creates each coroutine as it walks the implementations and
+                # raises when it reaches one that needs an omitted argument,
+                # leaving the earlier coroutines unawaited. Binding here means
+                # the raise happens with nothing built; the call itself is
+                # still pluggy's, so argument defaults, **kwargs handling,
+                # None-dropping and the historic-hook refusal behave exactly as
+                # they do on the plain path.
+                try:
+                    for hook_impl in reversed(hook.get_hookimpls()):
+                        _impl_kwargs(hook_impl, call_kwargs)
+                except HookCallError:
+                    # The raise pre-empts HookCaller.__call__, which is where
+                    # pluggy warns about spec args missing from the call; warn
+                    # here instead, as the two branches above do. On success
+                    # the hook call below warns, so warning here too would
+                    # emit it twice.
+                    hook._verify_all_args_are_provided(call_kwargs)
+                    raise
+                # *args is forwarded as it was before this branch bound the
+                # arguments; hooks are keyword-only by convention, but a caller
+                # that passed positional arguments still gets pluggy's error.
+                return await asyncio.gather(*hook(*args, **call_kwargs))
 
         return call
 
