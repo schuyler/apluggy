@@ -10,7 +10,7 @@ import gc
 import warnings
 
 import pytest
-from pluggy import HookCallError
+from pluggy import HookCallError, HookCaller
 
 import apluggy as pluggy
 from apluggy import PluginManager
@@ -236,6 +236,12 @@ async def test_a_sync_impl_returning_none_is_skipped_like_multicall() -> None:
     assert await pm.ahook.all_plain(channel=1) == [6, 1]
 
 
+# Spec defaults (HookCaller._apply_defaults) arrive in pluggy 1.7; below that
+# pluggy itself has no such behaviour for the broadcast to inherit.
+@pytest.mark.skipif(
+    not hasattr(HookCaller, "_apply_defaults"),
+    reason="hookspec defaults need pluggy >= 1.7",
+)
 async def test_the_broadcast_applies_the_spec_defaults() -> None:
     """An omitted argument takes the *hookspec's* default, as HookCaller does.
 
@@ -334,3 +340,58 @@ async def test_a_forwarded_kwarg_is_not_passed_to_an_impl_kwargs(monkeypatch) ->
     pm.register(Sink(), name="sink")
 
     assert await pm.ahook.extras(x=1, extra=2) == [(1, [])]
+
+
+async def test_broadcast_warns_once_about_a_missing_spec_arg() -> None:
+    """A successful broadcast that omits a spec arg warns once, as pluggy does.
+
+    The branch binds arguments itself and then calls the hook through pluggy,
+    whose ``HookCaller.__call__`` emits the warning; warning in the branch as
+    well would emit it twice.
+    """
+
+    class OnceSpec:
+        @hookspec
+        async def extra_plain(self, channel: int, extra: int) -> int: ...  # pragma: no cover
+
+    class Plugin:
+        @hookimpl
+        async def extra_plain(self, channel: int) -> int:
+            return channel
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(OnceSpec)
+    pm.register(Plugin())
+
+    # Record every warning, so a duplicate is not deduplicated by the filter.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert await pm.ahook.extra_plain(channel=1) == [1]
+
+    missing = [w for w in caught if _WARNING_MATCH in str(w.message)]
+    assert len(missing) == 1
+
+
+async def test_plain_broadcast_missing_arg_warns_and_raises() -> None:
+    """The plain broadcast's raise still carries pluggy's spec-arg warning.
+
+    Pre-binding raises before ``HookCaller.__call__`` runs, so the branch has
+    to emit the warning itself, as the firstresult and wrapper branches do.
+    """
+
+    class PlainSpec:
+        @hookspec
+        async def plain(self, channel: int) -> int: ...  # pragma: no cover
+
+    class Plugin:
+        @hookimpl
+        async def plain(self, channel: int) -> int:
+            return channel
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(PlainSpec)
+    pm.register(Plugin())
+
+    with pytest.warns(UserWarning, match=_WARNING_MATCH):
+        with pytest.raises(HookCallError, match=_ERROR_MATCH):
+            await pm.ahook.plain(chanel=1)

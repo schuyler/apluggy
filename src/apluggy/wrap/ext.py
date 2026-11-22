@@ -299,13 +299,7 @@ class AHook:
             else:
                 # firstresult=False, no wrappers: bind every implementation's
                 # arguments, then run them concurrently.
-                # This branch skips HookCaller.__call__, so warn about omitted
-                # spec args here as the two above do. That warning is not what
-                # stops the never-awaited coroutines: the missing argument
-                # belongs to an implementation, and it is the pre-binding below
-                # that raises before any coroutine exists.
                 call_kwargs = _apply_spec_defaults(hook, kwargs)
-                hook._verify_all_args_are_provided(call_kwargs)
                 # Validate every implementation's arguments before pluggy
                 # builds a single coroutine. This is the whole reason this
                 # branch does not just call the hook: pluggy's _multicall
@@ -316,8 +310,17 @@ class AHook:
                 # still pluggy's, so argument defaults, **kwargs forwarding,
                 # None-dropping and the historic-hook refusal behave exactly as
                 # they do on the plain path.
-                for hook_impl in reversed(hook.get_hookimpls()):
-                    _impl_kwargs(hook_impl, call_kwargs)
+                try:
+                    for hook_impl in reversed(hook.get_hookimpls()):
+                        _impl_kwargs(hook_impl, call_kwargs)
+                except HookCallError:
+                    # The raise pre-empts HookCaller.__call__, which is where
+                    # pluggy warns about spec args missing from the call; warn
+                    # here instead, as the two branches above do. On success
+                    # the hook call below warns, so warning here too would
+                    # emit it twice.
+                    hook._verify_all_args_are_provided(call_kwargs)
+                    raise
                 # *args is forwarded as it was before this branch bound the
                 # arguments; hooks are keyword-only by convention, but a caller
                 # that passed positional arguments still gets pluggy's error.
