@@ -16,25 +16,17 @@ def _impl_kwargs(
 ) -> dict[str, Any]:
     """The keyword arguments one implementation is called with.
 
-    Mirrors pluggy's _multicall: the names it declares come from the call (a
-    missing one is a caller error, raised as HookCallError rather than a bare
-    KeyError), and anything else the caller passed goes on to an implementation
-    that accepts **kwargs. Without that second part a keyword argument an
-    implementation does not declare is silently dropped instead of reaching it.
+    Mirrors pluggy's _multicall: only the names the implementation declares are
+    taken from the call, and a missing one is a caller error, raised as
+    HookCallError rather than a bare KeyError. Anything else the caller passed is
+    not forwarded, even to an implementation that accepts **kwargs -- pluggy
+    does not forward it either, and matching that matters more than improving on
+    it (see test_a_forwarded_kwarg_is_not_passed_to_an_impl_kwargs).
     """
     try:
-        kwargs = {k: caller_kwargs[k] for k in hook_impl.argnames}
+        return {k: caller_kwargs[k] for k in hook_impl.argnames}
     except KeyError as e:
         raise HookCallError(f"hook call must provide argument {e.args[0]!r}") from e
-    if hook_impl.kwargnames:
-        kwargs.update(
-            {
-                k: v
-                for k, v in caller_kwargs.items()
-                if k not in hook_impl.argnames
-            }
-        )
-    return kwargs
 
 
 def _apply_spec_defaults(
@@ -307,11 +299,11 @@ class AHook:
             else:
                 # firstresult=False, no wrappers: bind every implementation's
                 # arguments, then run them concurrently.
-                # This branch also skips HookCaller.__call__, so warn about
-                # omitted spec args here as the two above do. That warning is not
-                # what stops the never-awaited coroutines: the missing argument
-                # belongs to an implementation, and it is the pre-binding in
-                # _call_broadcast that raises before any coroutine exists.
+                # This branch skips HookCaller.__call__, so warn about omitted
+                # spec args here as the two above do. That warning is not what
+                # stops the never-awaited coroutines: the missing argument
+                # belongs to an implementation, and it is the pre-binding below
+                # that raises before any coroutine exists.
                 call_kwargs = _apply_spec_defaults(hook, kwargs)
                 hook._verify_all_args_are_provided(call_kwargs)
                 # Validate every implementation's arguments before pluggy
@@ -326,7 +318,10 @@ class AHook:
                 # they do on the plain path.
                 for hook_impl in reversed(hook.get_hookimpls()):
                     _impl_kwargs(hook_impl, call_kwargs)
-                return await asyncio.gather(*hook(**call_kwargs))
+                # *args is forwarded as it was before this branch bound the
+                # arguments; hooks are keyword-only by convention, but a caller
+                # that passed positional arguments still gets pluggy's error.
+                return await asyncio.gather(*hook(*args, **call_kwargs))
 
         return call
 
