@@ -294,3 +294,43 @@ async def test_an_async_return_of_none_keeps_its_slot() -> None:
 
     # Reversed registration order, as pluggy dispatches.
     assert await pm.ahook.slots(x=1) == [1, None, 10]
+
+
+def test_apply_spec_defaults_skips_a_pluggy_without_the_api() -> None:
+    """pluggy < 1.7 has no ``HookCaller._apply_defaults``; the helper must not need it.
+
+    This package declares ``pluggy>=1.3``. The helper applies the spec defaults
+    when pluggy offers the method and returns the call's own kwargs when it does
+    not, which is the behaviour those versions already had. Tested on the helper
+    rather than by deleting the attribute from a 1.7 class: 1.7's own
+    ``__call__`` references it, so removing it simulates nothing real.
+    """
+
+    from types import SimpleNamespace
+
+    from apluggy.wrap.ext import _apply_spec_defaults
+
+    assert _apply_spec_defaults(SimpleNamespace(), {"x": 1}) == {"x": 1}
+
+
+async def test_a_forwarded_kwarg_is_not_passed_to_an_impl_kwargs(monkeypatch) -> None:
+    """pluggy passes only ``argnames``; an impl's ``**kwargs`` sees nothing extra.
+
+    Pinned because the re-implemented broadcast got this wrong once, and the
+    delegated call has to keep matching pluggy rather than improving on it.
+    """
+
+    class Spec:
+        @hookspec
+        async def extras(self, x: int) -> tuple: ...  # pragma: no cover
+
+    class Sink:
+        @hookimpl
+        async def extras(self, x: int, **kwargs):
+            return (x, sorted(kwargs))
+
+    pm = PluginManager(_PROJECT)
+    pm.add_hookspecs(Spec)
+    pm.register(Sink(), name="sink")
+
+    assert await pm.ahook.extras(x=1, extra=2) == [(1, [])]

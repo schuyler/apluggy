@@ -37,6 +37,22 @@ def _impl_kwargs(
     return kwargs
 
 
+def _apply_spec_defaults(
+    hook: HookCaller, caller_kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply the hookspec's defaults to a copy of the call's kwargs.
+
+    ``HookCaller._apply_defaults`` arrives in pluggy 1.7 and this package
+    supports 1.3 upwards, so it is used when present and skipped when not: on
+    older pluggy a spec default simply does not exist, which is the behaviour
+    those versions already had.
+    """
+    apply_defaults = getattr(hook, "_apply_defaults", None)
+    if apply_defaults is None:
+        return dict(caller_kwargs)
+    return dict(apply_defaults(caller_kwargs))
+
+
 async def _call_firstresult(
     hook: HookCaller,
     caller_kwargs: dict[str, Any],
@@ -67,43 +83,6 @@ async def _call_firstresult(
 
     # All implementations returned None; return None to the caller.
     return None
-
-
-async def _call_broadcast(
-    hook: HookCaller,
-    caller_kwargs: dict[str, Any],
-) -> list[Any]:
-    """Await every implementation concurrently, binding all of them first.
-
-    pluggy's _multicall builds each implementation's coroutine as it walks the
-    list and raises when it reaches one that needs an argument the call omitted,
-    which leaves the coroutines it had already built unawaited. Binding every
-    implementation's arguments before creating any coroutine means a missing
-    argument raises with nothing left behind.
-
-    Order and length match `_multicall`: implementations in reverse storage
-    order, one slot each, in that order. `_multicall` drops a call that returned
-    None, which for an async implementation never happens -- its call returns a
-    coroutine -- so an awaited None keeps its slot.
-
-    Unlike ``HookCaller.__call__`` this does not refuse a historic hook: the
-    async wrappers in this module are for coroutine hooks, and a historic spec
-    dispatched through here returns a list instead of raising AssertionError.
-    """
-    bound = [
-        (hook_impl, _impl_kwargs(hook_impl, caller_kwargs))
-        for hook_impl in reversed(hook.get_hookimpls())
-    ]
-    # Call in order, as _multicall does, and skip a call that returned None: it
-    # is not a result there either, and a sync implementation returning None
-    # must not be handed to gather, which would raise "an asyncio.Future ...
-    # is required" on a path that used to work.
-    pending: list[Any] = []
-    for hook_impl, impl_kwargs in bound:
-        result = hook_impl.function(**impl_kwargs)
-        if result is not None:
-            pending.append(result)
-    return list(await asyncio.gather(*pending))
 
 
 async def _async_multicall(
@@ -333,9 +312,21 @@ class AHook:
                 # what stops the never-awaited coroutines: the missing argument
                 # belongs to an implementation, and it is the pre-binding in
                 # _call_broadcast that raises before any coroutine exists.
-                call_kwargs = dict(hook._apply_defaults(kwargs))
+                call_kwargs = _apply_spec_defaults(hook, kwargs)
                 hook._verify_all_args_are_provided(call_kwargs)
-                return await _call_broadcast(hook, call_kwargs)
+                # Validate every implementation's arguments before pluggy
+                # builds a single coroutine. This is the whole reason this
+                # branch does not just call the hook: pluggy's _multicall
+                # creates each coroutine as it walks the implementations and
+                # raises when it reaches one that needs an omitted argument,
+                # leaving the earlier coroutines unawaited. Binding here means
+                # the raise happens with nothing built; the call itself is
+                # still pluggy's, so argument defaults, **kwargs forwarding,
+                # None-dropping and the historic-hook refusal behave exactly as
+                # they do on the plain path.
+                for hook_impl in reversed(hook.get_hookimpls()):
+                    _impl_kwargs(hook_impl, call_kwargs)
+                return await asyncio.gather(*hook(**call_kwargs))
 
         return call
 
