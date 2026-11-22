@@ -307,7 +307,7 @@ class AHook:
                 # raises when it reaches one that needs an omitted argument,
                 # leaving the earlier coroutines unawaited. Binding here means
                 # the raise happens with nothing built; the call itself is
-                # still pluggy's, so argument defaults, **kwargs forwarding,
+                # still pluggy's, so argument defaults, **kwargs handling,
                 # None-dropping and the historic-hook refusal behave exactly as
                 # they do on the plain path.
                 try:
